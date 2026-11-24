@@ -1,0 +1,544 @@
+"""Tables and figures from the saved results. Nothing here trains a model.
+
+    python -m src.report
+
+Reads reports/metrics/{random,time}.json, reports/data_checks.json and the scores in
+reports/scores/, then writes reports/results.md and the figures in reports/figures/.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.ticker import FuncFormatter
+from sklearn.metrics import precision_recall_curve, roc_curve
+
+from src.config import load_config, reports_dir
+from src.models import LABELS, MODEL_NAMES
+from src.threshold import cost_curve
+
+PROTOCOLS = {"time": "Protocol B: time-ordered", "random": "Protocol A: stratified"}
+WEIGHTS = {True: {"logreg": "balanced", "rf": "balanced", "xgb": "scale_pos_weight"}, False: "none"}
+
+# ----------------------------------------------------------------- style
+# Light chart surface, recessive hairline grid, text in ink tones (never in series colors).
+# Series colors follow the entity in every figure: XGBoost blue, random forest orange,
+# logistic regression aqua. Two-series figures use blue then orange.
+SURFACE, INK, INK_2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
+MODEL_COLORS = {"xgb": "#2a78d6", "rf": "#eb6834", "logreg": "#1baf7a"}
+PAIR = ("#2a78d6", "#eb6834")
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
+    "axes.edgecolor": AXIS, "axes.linewidth": 0.8, "axes.labelcolor": INK_2, "axes.titlecolor": INK,
+    "axes.titlesize": 11, "axes.titleweight": "bold", "axes.titlelocation": "left", "axes.labelsize": 9.5,
+    "axes.spines.top": False, "axes.spines.right": False, "axes.grid": True,
+    "grid.color": GRID, "grid.linewidth": 0.6, "grid.linestyle": "-",
+    "xtick.color": MUTED, "ytick.color": MUTED, "xtick.labelcolor": INK_2, "ytick.labelcolor": INK_2,
+    "xtick.labelsize": 8.5, "ytick.labelsize": 8.5, "legend.fontsize": 8.5, "legend.frameon": False,
+    "lines.linewidth": 1.8, "lines.solid_capstyle": "round", "lines.solid_joinstyle": "round",
+    "font.family": "sans-serif", "figure.dpi": 100, "savefig.dpi": 150, "savefig.bbox": "tight",
+})
+
+
+def key(name: str, weighted: bool) -> str:
+    return f"{name}_{'w' if weighted else 'u'}"
+
+
+def weights_label(name: str, weighted: bool) -> str:
+    return WEIGHTS[True][name] if weighted else "none"
+
+
+# ------------------------------------------------------------- formatting
+def f3(x) -> str:
+    return "–" if x is None else f"{x:.3f}"
+
+
+def ci(pair) -> str:
+    return f"{pair[0]:.3f}–{pair[1]:.3f}"
+
+
+def thr(t) -> str:
+    if t is None:
+        return "flag nothing"
+    return f"{t:.2e}" if t < 1e-3 else (f"{t:.4f}" if t < 0.999 else f"{t:.6f}")
+
+
+def signed(x) -> str:
+    """+0.012 / -0.012, and 0.000 rather than -0.000."""
+    text = f"{x:+.3f}"
+    return "0.000" if text in ("+0.000", "-0.000") else text
+
+
+def amount(x) -> str:
+    return "–" if x is None else f"{x:,.2f}"
+
+
+def score(x) -> str:
+    """Scores span 1e-5 to 1: four significant figures, without hiding tiny ones as 0.0000."""
+    return "–" if x is None else (f"{x:.2e}" if x < 1e-3 else f"{x:.4f}")
+
+
+def pct(x) -> str:
+    return f"{100 * x:.1f}%"
+
+
+def money(x) -> str:
+    return f"{x:,.0f}"
+
+
+def table(header: list[str], rows: list[list], align: str | None = None) -> str:
+    align = align or "l" + "r" * (len(header) - 1)
+    marks = {"l": "---", "r": "---:", "c": ":---:"}
+    lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(marks[a] for a in align) + " |"]
+    lines += ["| " + " | ".join(str(c) for c in row) + " |" for row in rows]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ load
+def load(rep: Path) -> tuple[dict, dict]:
+    metrics = {}
+    for protocol in PROTOCOLS:
+        path = rep / "metrics" / f"{protocol}.json"
+        if path.exists():
+            metrics[protocol] = json.loads(path.read_text(encoding="utf-8"))
+    checks_path = rep / "data_checks.json"
+    checks = json.loads(checks_path.read_text(encoding="utf-8")) if checks_path.exists() else {}
+    if not metrics:
+        raise SystemExit("no metrics found: run `python -m src.train --protocol time` (and random) first")
+    return metrics, checks
+
+
+def scores(rep: Path, protocol: str, k: str, part: str) -> np.ndarray:
+    return np.load(rep / "scores" / f"{protocol}_{k}_{part}.npy")
+
+
+def labels(rep: Path, protocol: str, part: str) -> np.ndarray:
+    return np.load(rep / "scores" / f"{protocol}_y_{part}.npy")
+
+
+# ---------------------------------------------------------------- tables
+def results_markdown(metrics: dict, checks: dict) -> str:
+    any_m = next(iter(metrics.values()))
+    r = any_m["main_cost_ratio"]
+    n_boot = any_m["config"]["evaluation"]["bootstrap_resamples"]
+    d = any_m["data"]
+    out = ["# Results", "",
+           "Generated by `python -m src.report` from `reports/metrics/*.json`. Don't edit by hand: "
+           "rerun the pipeline instead.", ""]
+
+    # data and splits
+    out += ["## Data and splits", ""]
+    if checks:
+        out += [f"File `{checks['file']}`, SHA-256 `{checks['sha256']}`: {checks['rows']:,} rows, "
+                f"{checks['frauds']} frauds, {checks['missing_values']} missing values.", ""]
+    out += [f"De-duplication removed {d['duplicates_dropped']:,} exact copies ({d['fraud_duplicates_dropped']} of "
+            f"them fraud), leaving {d['rows_after']:,} rows and {d['frauds_after']} frauds "
+            f"({100 * d['fraud_rate_after']:.3f}%). Rows with identical features but different labels: "
+            f"{d['same_features_different_label']}.", ""]
+    rows = []
+    for protocol, m in metrics.items():
+        for block, s in m["split"].items():
+            rows.append([PROTOCOLS[protocol], block, f"{s['rows']:,}", s["frauds"], f"{100 * s['fraud_rate']:.3f}%",
+                         f"{s['hours'][0]:.1f}–{s['hours'][1]:.1f}"])
+    out += [table(["Protocol", "Block", "Rows", "Frauds", "Fraud rate", "Hours since file start"], rows, "llrrrr"), ""]
+    out += [f"Class weight (legitimate rows per fraud in the training data): "
+            + ", ".join(f"{PROTOCOLS[p].split(':')[0]} {m['class_weight']:.1f}" for p, m in metrics.items())
+            + f". Main cost ratio r = {r} (a missed fraud costs {r} reviews). "
+            f"Intervals: {n_boot:,} stratified bootstrap resamples, 95% percentile.", ""]
+
+    # 11.1 / 11.2
+    if "time" in metrics:
+        m = metrics["time"]
+        t = m["split"]["test"]
+        out += [f"## 11.1 Protocol B: time-ordered test block ({t['rows']:,} rows, {t['frauds']} frauds)", ""]
+        rows = []
+        for name in MODEL_NAMES:
+            for w in (True, False):
+                res = m["models"].get(key(name, w))
+                if res:
+                    te = res["test"]
+                    rows.append([LABELS[name], weights_label(name, w), f"{f3(te['pr_auc'])} ({ci(te['pr_auc_ci95'])})",
+                                 f3(te["roc_auc"]), f3(te["recall_at_1pct_fpr"])])
+        rows.append(["No-skill baseline", "", f"{t['fraud_rate']:.4f}", "0.500", "0.010"])
+        out += [table(["Model", "Class weights", "PR-AUC (95% CI)", "ROC-AUC", "Recall at 1% FPR"], rows, "llrrr"), ""]
+    if "random" in metrics:
+        m = metrics["random"]
+        t = m["split"]["test"]
+        out += [f"## 11.2 Protocol A: stratified test set ({t['rows']:,} rows, {t['frauds']} frauds)", ""]
+        rows = []
+        for name in MODEL_NAMES:
+            for w in (True, False):
+                res = m["models"].get(key(name, w))
+                if res:
+                    te, se = res["test"], res["selection"]
+                    rows.append([LABELS[name], weights_label(name, w), f"{f3(te['pr_auc'])} ({ci(te['pr_auc_ci95'])})",
+                                 f3(te["roc_auc"]), f"{se['cv_mean']:.3f} ± {se['cv_sd']:.3f}"])
+        rows.append(["No-skill baseline", "", f"{t['fraud_rate']:.4f}", "0.500", ""])
+        out += [table(["Model", "Class weights", "PR-AUC, test (95% CI)", "ROC-AUC, test",
+                       "PR-AUC, 5-fold CV (mean ± SD)"], rows, "llrrr"), ""]
+
+    # ranking agreement between the two metrics
+    out += ["## 11.2b Do PR-AUC and ROC-AUC rank the models the same way? (test sets)", ""]
+    rows = []
+    for protocol, m in metrics.items():
+        for w in (True, False):
+            ks = [key(n, w) for n in MODEL_NAMES if key(n, w) in m["models"]]
+            by_pr = sorted(ks, key=lambda k: -m["models"][k]["test"]["pr_auc"])
+            by_roc = sorted(ks, key=lambda k: -m["models"][k]["test"]["roc_auc"])
+            name = lambda k: LABELS[m["models"][k]["model"]]  # noqa: E731
+            rows.append([PROTOCOLS[protocol], "on" if w else "off", " > ".join(map(name, by_pr)),
+                         " > ".join(map(name, by_roc)), "yes" if by_pr == by_roc else "**no**"])
+    out += [table(["Protocol", "Class weights", "Order by PR-AUC", "Order by ROC-AUC", "Same order?"], rows, "lllll"), ""]
+
+    # 11.3 paired comparisons
+    out += ["## 11.3 Paired model comparisons (difference in test PR-AUC)", ""]
+    rows = []
+    names = {"xgb_w": "XGBoost", "rf_w": "random forest", "logreg_w": "logistic regression"}
+    for protocol in ("time", "random"):
+        if protocol in metrics:
+            for comp, res in metrics[protocol]["comparisons"].items():
+                a, b = comp.split("_minus_")
+                rows.append([f"{names[a]} − {names[b]}", PROTOCOLS[protocol].split(":")[0],
+                             f"{signed(res['diff'])} ({signed(res['diff_ci95'][0])} to {signed(res['diff_ci95'][1])})",
+                             pct(res["share_of_resamples_a_wins"])])
+    out += [table(["Comparison (class-weighted models)", "Protocol", "Difference (95% CI)",
+                   "Resamples the first model wins"], rows, "llrr"), ""]
+
+    # 11.4 operating points
+    for protocol in ("time", "random"):
+        if protocol not in metrics:
+            continue
+        m = metrics[protocol]
+        source = "validation block" if protocol == "time" else "out-of-fold predictions on the training 80%"
+        heading = "11.4 Operating point" if protocol == "time" else "11.4b Operating point"
+        out += [f"## {heading}: {PROTOCOLS[protocol]}, r = {r}, threshold from the {source}", ""]
+        rows = []
+        for name in MODEL_NAMES:
+            for w in (True, False):
+                res = m["models"].get(key(name, w))
+                if res:
+                    op = res["test"]["operating_point"]
+                    rows.append([LABELS[name], weights_label(name, w), thr(op["threshold"]), op["alerts"], op["tp"], op["fp"],
+                                 op["fn"], f3(op["precision"]), f3(op["recall"]), money(op["cost"])])
+        out += [table(["Model", "Class weights", "Threshold", "Alerts", "Frauds caught", "False alerts",
+                       "Frauds missed", "Precision", "Recall", "Cost (reviews)"], rows, "llrrrrrrrr"), ""]
+
+    # capacity view
+    if "time" in metrics:
+        m = metrics["time"]
+        ks = [row["k"] for row in m["models"]["xgb_w"]["test"]["top_k"]]
+        out += ["## 11.4c Capacity: if the team can review only k alerts (Protocol B test block)", ""]
+        rows = []
+        for name in MODEL_NAMES:
+            for w in (True, False):
+                res = m["models"].get(key(name, w))
+                if res:
+                    rows.append([LABELS[name], weights_label(name, w),
+                                 *[f"{row['frauds']} ({pct(row['precision'])})" for row in res["test"]["top_k"]]])
+        out += [table(["Model", "Class weights", *[f"Frauds in top {k}" for k in ks]], rows, "ll" + "r" * len(ks)), ""]
+
+    # 11.5 sweep
+    for protocol in ("time", "random"):
+        if protocol not in metrics:
+            continue
+        m = metrics[protocol]
+        block = "validation block" if protocol == "time" else "out-of-fold predictions"
+        out += [f"## 11.5{'' if protocol == 'time' else 'b'} Threshold against the cost ratio "
+                f"(XGBoost, {PROTOCOLS[protocol]}, {block})", ""]
+        sw, su = m["models"]["xgb_w"]["sweep"], m["models"]["xgb_u"]["sweep"]
+        frauds = sw[0]["frauds"]
+        rows = [[a["cost_ratio"], f"{a['calibrated_theory']:.3f}", thr(a["threshold"]), a["alerts"], a["tp"],
+                 thr(b["threshold"]), b["alerts"], b["tp"]] for a, b in zip(sw, su)]
+        out += [f"Frauds in the selection set: {frauds}.", "",
+                table(["r", "1 / (1 + r)", "Threshold, weighted", "Alerts", "Frauds caught",
+                       "Threshold, unweighted", "Alerts", "Frauds caught"], rows), ""]
+
+    # 11.6 E2
+    out += ["## 11.6 Class weights vs threshold (E2, selection scores)", ""]
+    rows = []
+    for name in ("xgb", "logreg", "rf"):
+        for protocol in ("time", "random"):
+            e = metrics.get(protocol, {}).get("class_weight_experiment", {}).get(name)
+            if e:
+                lo, hi = e["pr_auc_diff_ci95"]
+                rows.append([LABELS[name], PROTOCOLS[protocol].split(":")[0], f3(e["pr_auc_weighted"]),
+                             f3(e["pr_auc_unweighted"]), f"{signed(e['pr_auc_diff'])} ({signed(lo)} to {signed(hi)})",
+                             thr(e["threshold_weighted"]), thr(e["threshold_unweighted"]),
+                             thr(e["odds_theory_threshold_weighted"]), f"{e['spearman_rho']:.3f}"])
+    out += [table(["Model", "Protocol", "PR-AUC weighted", "PR-AUC unweighted", "Difference (95% CI)",
+                   "Threshold weighted", "Threshold unweighted", "Odds-theory prediction", "Spearman ρ"],
+                  rows, "llrrrrrrr"), ""]
+
+    # E3
+    if "time" in metrics and "random" in metrics:
+        out += ["## E3: how much does a random split flatter the models? (test PR-AUC)", ""]
+        rows = []
+        a, b = metrics["random"], metrics["time"]
+        for name in MODEL_NAMES:
+            for w in (True, False):
+                k = key(name, w)
+                pa, pb = a["models"][k]["test"]["pr_auc"], b["models"][k]["test"]["pr_auc"]
+                rows.append([LABELS[name], weights_label(name, w), f3(pa), f3(pb), signed(pb - pa)])
+        rows.append(["No-skill baseline", "", f"{a['split']['test']['fraud_rate']:.4f}",
+                     f"{b['split']['test']['fraud_rate']:.4f}", ""])
+        out += [table(["Model", "Class weights", "Protocol A (stratified)", "Protocol B (time-ordered)",
+                       "Change"], rows, "llrrr"), ""]
+
+    # 11.7 E4 calibration
+    if "time" in metrics and metrics["time"].get("calibration"):
+        cal = metrics["time"]["calibration"]
+        out += ["## 11.7 Calibration (E4, Protocol B test block; sigmoid fitted on the validation block)", ""]
+        rows = [[{"xgb_w": "XGBoost, weighted", "xgb_u": "XGBoost, unweighted"}[k], f"{c['brier_raw']:.6f}",
+                 f"{c['brier_sigmoid']:.6f}", f"{c['expected_frauds_raw']:.1f}", f"{c['expected_frauds_sigmoid']:.1f}",
+                 c["actual_frauds"]] for k, c in cal.items()]
+        out += [table(["Model", "Brier, raw", "Brier, sigmoid", "Expected frauds, raw", "Expected frauds, sigmoid",
+                       "Actual frauds"], rows), ""]
+        rows = []
+        for k, c in cal.items():
+            for kind in ("raw", "sigmoid"):
+                for band in c[f"bands_{kind}"]:
+                    rows.append([{"xgb_w": "weighted", "xgb_u": "unweighted"}[k], kind, band["band"], f"{band['n']:,}",
+                                 f"{band['expected_frauds']:.1f}", band["actual_frauds"]])
+        out += ["Expected (sum of scores) vs actual frauds per score band:", "",
+                table(["XGBoost", "Scores", "Band", "Transactions", "Expected frauds", "Actual frauds"], rows, "lllrrr"), ""]
+
+    # E5 explanations
+    ex = metrics.get("time", {}).get("explanations")
+    if ex:
+        out += [f"## 12. Explanations and error analysis (E5, {ex['model']}, Protocol B test block)", ""]
+        top = list(ex["shap_mean_abs"].items())[:10]
+        out += ["Mean |SHAP| (log-odds), top 10: " + ", ".join(f"{k} {v:.2f}" for k, v in top) + ".", ""]
+        cs, ms = ex["caught_frauds_summary"], ex["missed_frauds_summary"]
+        out += [table(["Frauds", "Count", "Median amount", "Median score"],
+                      [["caught", cs["n"], amount(cs["median_amount"]), score(cs["median_score"])],
+                       ["missed", ms["n"], amount(ms["median_amount"]), score(ms["median_score"])]]), ""]
+        fmt_top = lambda row: ", ".join(f"{f} {v:+.2f}" for f, v in row["top_shap"])  # noqa: E731
+        out += ["Missed frauds, highest score first:", "",
+                table(["Amount", "Hour", "Score", "Largest SHAP pushes"],
+                      [[amount(row["amount"]), row["hour"], score(row["score"]), fmt_top(row)]
+                       for row in ex["missed_frauds"]], "rrrl"), "",
+                "Highest-scoring false alerts:", "",
+                table(["Amount", "Hour", "Score", "Largest SHAP pushes"],
+                      [[amount(row["amount"]), row["hour"], score(row["score"]), fmt_top(row)]
+                       for row in ex["top_false_alerts"]], "rrrl"), ""]
+
+    # E6 amount-based costs
+    e6 = metrics.get("time", {}).get("amount_based_costs")
+    if e6:
+        out += [f"## E6: amount-dependent costs ({e6['model']}, Protocol B test block, money units)", "",
+                f"A missed fraud costs its amount plus {e6['miss_handling_cost']:g} handling; every alert costs "
+                f"{e6['review_cost']:g} to review. Money-optimal threshold on validation: "
+                f"{thr(e6['money_threshold_from_validation'])}.", ""]
+        labels_ = {"flag_nothing": "Flag nothing", "constant_ratio": f"Constant cost ratio (r = {r})",
+                   "money_threshold": "One threshold, chosen on validation by money cost",
+                   "per_transaction": "Per transaction: calibrated p × (amount + handling) > review cost"}
+        rows = [[labels_[k], money(p["total"]), money(p["fraud_lost"]), money(p["review_spend"]), p["alerts"],
+                 p["frauds_caught"], p["false_alerts"]] for k, p in e6["policies"].items()]
+        out += [table(["Policy", "Total cost", "Fraud lost", "Review spend", "Alerts", "Frauds caught",
+                       "False alerts"], rows), ""]
+
+    b = metrics.get("time", {}).get("bundle")
+    if b:
+        out += [f"Served model: `{b['version']}`, threshold {thr(b['threshold'])}.", ""]
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------- figures
+def save(fig, path: Path) -> None:
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def fig_pr_roc(rep: Path, figs: Path, protocol: str, m: dict) -> None:
+    y = labels(rep, protocol, "test")
+    t = m["split"]["test"]
+    what = f"{PROTOCOLS[protocol].split(': ')[1]} test set, {t['frauds']} frauds in {t['rows']:,} transactions"
+    order = ["xgb", "rf", "logreg"]
+
+    # Curves are drawn from sklearn's curve functions directly (the Display classes change API
+    # between versions). The PR curve is a step plot, the shape average precision sums over.
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    for name in order:
+        s = scores(rep, protocol, key(name, True), "test")
+        precision, recall, _ = precision_recall_curve(y, s)
+        ax.step(recall, precision, where="post", color=MODEL_COLORS[name],
+                label=f"{LABELS[name]} (PR-AUC {m['models'][key(name, True)]['test']['pr_auc']:.3f})")
+    ax.axhline(t["fraud_rate"], color=MUTED, lw=1)
+    ax.annotate(f"no skill = fraud rate ({t['fraud_rate']:.4f})", (0.01, t["fraud_rate"]),
+                xytext=(0, 4), textcoords="offset points", ha="left", va="bottom", color=INK_2, fontsize=8)
+    ax.set(xlim=(0, 1.01), ylim=(0, 1.02), xlabel="Recall (share of frauds caught)",
+           ylabel="Precision (share of alerts that are fraud)")
+    ax.set_title(f"Precision–recall, class-weighted models\n{what}", fontsize=10.5)
+    ax.legend(loc="lower left", bbox_to_anchor=(0.02, 0.08))
+    save(fig, figs / f"pr_curves_{protocol}.png")
+
+    fig, ax = plt.subplots(figsize=(6.2, 4.4))
+    for name in order:
+        s = scores(rep, protocol, key(name, True), "test")
+        fpr, tpr, _ = roc_curve(y, s)
+        ax.plot(fpr, tpr, color=MODEL_COLORS[name],
+                label=f"{LABELS[name]} (ROC-AUC {m['models'][key(name, True)]['test']['roc_auc']:.3f})")
+    ax.plot([0, 1], [0, 1], color=MUTED, lw=1)
+    ax.set(xlabel="False positive rate (share of legitimate transactions flagged)",
+           ylabel="True positive rate (recall)")
+    ax.set_title(f"ROC, class-weighted models\n{what}", fontsize=10.5)
+    ax.legend(loc="lower right")
+    save(fig, figs / f"roc_curves_{protocol}.png")
+
+
+def fig_cost_curve(rep: Path, figs: Path, m: dict) -> None:
+    y = labels(rep, "time", "sel")
+    r = m["main_cost_ratio"]
+    c_review = m["config"]["costs"]["c_review"]
+    fig, ax = plt.subplots(figsize=(6.6, 4.2))
+    for (k, label), color in zip([("xgb_w", "weighted"), ("xgb_u", "unweighted")], PAIR):
+        s = scores(rep, "time", k, "sel")
+        t, cost, _, _ = cost_curve(y, s, c_miss=r * c_review, c_review=c_review)
+        keep = np.isfinite(t) & (t > 0)
+        ax.plot(t[keep], cost[keep], color=color, label=f"XGBoost, {label}")
+        best = m["models"][k]["threshold"]
+        if best["threshold"] is not None:
+            ax.scatter([best["threshold"]], [best["cost"]], s=40, color=color, edgecolor=SURFACE, linewidth=1.5, zorder=5)
+            # both labels sit below the curves: weighted to the right of its dot, unweighted to the left
+            ax.annotate(f"{label}: t = {thr(best['threshold'])}\ncost {best['cost']:.0f}",
+                        (best["threshold"], best["cost"]),
+                        xytext=(6, -30) if label == "weighted" else (-6, -30), textcoords="offset points",
+                        ha="left" if label == "weighted" else "right", color=INK_2, fontsize=8)
+    nothing = r * c_review * int(y.sum())
+    ax.axhline(nothing, color=MUTED, lw=1)
+    ax.annotate(f"flag nothing: {nothing:.0f}", (1e-5, nothing), xytext=(2, 4), textcoords="offset points",
+                color=INK_2, fontsize=8)
+    ax.set_xscale("log")
+    ax.set(xlim=(1e-5, 1.05), ylim=(0, nothing * 1.6), xlabel="Decision threshold (log scale)",
+           ylabel="Cost on the validation block (reviews)")
+    ax.set_title(f"Cost against threshold, r = {r}: a missed fraud costs {r} reviews\n"
+                 "validation block; weighting moves the minimum, not its depth", fontsize=10.5)
+    ax.legend(loc="upper left")
+    save(fig, figs / "cost_curve_time.png")
+
+
+def fig_threshold_vs_ratio(rep: Path, figs: Path, m: dict) -> None:
+    sw, su = m["models"]["xgb_w"]["sweep"], m["models"]["xgb_u"]["sweep"]
+    r = np.array([row["cost_ratio"] for row in sw])
+    fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.6))
+    panels = [("threshold", "Cost-optimal threshold", True), ("alerts", "Alerts raised", True),
+              ("tp", "Frauds caught", False)]
+    for ax, (field, title, logy) in zip(axes, panels):
+        for sweep, label, color in [(sw, "weighted", PAIR[0]), (su, "unweighted", PAIR[1])]:
+            vals = np.array([np.nan if row[field] is None else row[field] for row in sweep], dtype=float)
+            ax.plot(r, vals, "-o", color=color, ms=4.5, mec=SURFACE, mew=1.2, label=f"XGBoost, {label}")
+        if field == "threshold":
+            ax.plot(r, 1 / (1 + r), "-", color=MUTED, lw=1.2, label="calibrated theory 1 / (1 + r)")
+        if field == "tp":
+            ax.axhline(sw[0]["frauds"], color=MUTED, lw=1)
+            ax.annotate(f"all {sw[0]['frauds']} frauds", (r[0], sw[0]["frauds"]), xytext=(0, 4),
+                        textcoords="offset points", color=INK_2, fontsize=8)
+        ax.set_xscale("log")
+        if logy:
+            ax.set_yscale("log")
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))  # 0.01, not 10^-2
+            if field == "alerts":
+                ax.set_yticks([50, 100, 200, 500, 1000, 2000])
+        ax.set_xticks(r, [str(v) for v in r])
+        ax.minorticks_off()
+        ax.set(xlabel="Cost ratio r = cost of a miss / cost of a review")
+        ax.set_title(title, fontsize=10.5)
+    axes[0].legend(loc="lower left", fontsize=8)
+    fig.suptitle("How the decision moves with the cost ratio (XGBoost, validation block)",
+                 x=0.01, ha="left", fontsize=11.5, fontweight="bold", color=INK)
+    fig.tight_layout()
+    save(fig, figs / "threshold_vs_cost_ratio.png")
+
+
+def fig_score_bands(rep: Path, figs: Path, m: dict) -> None:
+    cal = m["calibration"]
+    panels = [("xgb_w", "raw"), ("xgb_w", "sigmoid"), ("xgb_u", "raw"), ("xgb_u", "sigmoid")]
+    fig, axes = plt.subplots(1, 4, figsize=(12, 3.5), sharey=True)
+    for ax, (k, kind) in zip(axes, panels):
+        bands = cal[k][f"bands_{kind}"]
+        x = np.arange(len(bands))
+        ax.bar(x - 0.2, [b["expected_frauds"] for b in bands], width=0.38, color=PAIR[0], label="expected (sum of scores)")
+        ax.bar(x + 0.2, [b["actual_frauds"] for b in bands], width=0.38, color=PAIR[1], label="actual frauds")
+        ax.set_xticks(x, [b["band"] for b in bands], fontsize=8)
+        ax.grid(axis="x", visible=False)
+        variant = "weighted" if k == "xgb_w" else "unweighted"
+        ax.set_title(f"{variant}, {'raw scores' if kind == 'raw' else 'sigmoid-calibrated'}", fontsize=10)
+        ax.set_xlabel("score band")
+    axes[0].set_ylabel("frauds in band (test block)")
+    axes[0].legend(loc="upper left", fontsize=8)
+    fig.suptitle("Are the scores probabilities? Expected vs actual frauds per score band (XGBoost, test block)",
+                 x=0.01, ha="left", fontsize=11.5, fontweight="bold", color=INK)
+    fig.tight_layout()
+    save(fig, figs / "score_bands_time.png")
+
+
+def fig_shap(figs: Path, m: dict) -> None:
+    ex = m["explanations"]
+    top = list(ex["shap_mean_abs"].items())[:15][::-1]
+    fig, ax = plt.subplots(figsize=(6.2, 4.8))
+    ax.barh([k for k, _ in top], [v for _, v in top], height=0.6, color=MODEL_COLORS["xgb"])
+    ax.grid(axis="y", visible=False)
+    ax.set(xlabel="mean |SHAP value| (log-odds)")
+    variant = "class-weighted" if ex["model"].endswith("_w") else "unweighted"
+    ax.set_title(f"What drives the scores: top 15 features\nXGBoost ({variant}), time-ordered test block. "
+                 "V1–V28 are anonymised components", fontsize=10.5)
+    save(fig, figs / "shap_bar_time.png")
+
+
+def fig_score_hist(rep: Path, figs: Path, m: dict) -> None:
+    y = labels(rep, "time", "test")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+    bins = np.linspace(0, 1, 51)
+    for ax, (k, label) in zip(axes, [("xgb_w", "weighted"), ("xgb_u", "unweighted")]):
+        s = scores(rep, "time", k, "test")
+        ax.hist(s[y == 0], bins=bins, color=PAIR[0], alpha=0.85, label=f"legitimate ({(y == 0).sum():,})")
+        ax.hist(s[y == 1], bins=bins, color=PAIR[1], alpha=0.9, label=f"fraud ({(y == 1).sum()})")
+        t = m["models"][k]["threshold"]["threshold"]
+        if t is not None:
+            ax.axvline(t, color=INK_2, lw=1)
+            ax.annotate(f"threshold {thr(t)}", (t, 1), xycoords=("data", "axes fraction"), xytext=(4, -12),
+                        textcoords="offset points", ha="left", color=INK_2, fontsize=8)
+        ax.set_yscale("log")
+        ax.set(xlabel="model score")
+        ax.set_title(f"XGBoost, {label}", fontsize=10.5)
+        ax.legend(loc="upper right", bbox_to_anchor=(0.92, 1.0), fontsize=8)
+    axes[0].set_ylabel("transactions (log scale)")
+    fig.suptitle("Score distribution by class (time-ordered test block): weighted scores sit higher for both classes",
+                 x=0.01, ha="left", fontsize=11.5, fontweight="bold", color=INK)
+    fig.tight_layout()
+    save(fig, figs / "score_hist_time.png")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default=None)
+    args = parser.parse_args(argv)
+    matplotlib.use("Agg")  # files only, no windows (set here so notebooks keep inline plots)
+    cfg = load_config(args.config)
+    rep = reports_dir(cfg)
+    figs = rep / "figures"
+    figs.mkdir(parents=True, exist_ok=True)
+
+    metrics, checks = load(rep)
+    (rep / "results.md").write_text(results_markdown(metrics, checks) + "\n", encoding="utf-8")
+    for protocol, m in metrics.items():
+        fig_pr_roc(rep, figs, protocol, m)
+    if "time" in metrics:
+        m = metrics["time"]
+        fig_cost_curve(rep, figs, m)
+        fig_threshold_vs_ratio(rep, figs, m)
+        if m.get("calibration"):
+            fig_score_bands(rep, figs, m)
+        if m.get("explanations"):
+            fig_shap(figs, m)
+        fig_score_hist(rep, figs, m)
+    print(f"wrote {rep / 'results.md'} and figures in {figs}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,27 @@
+# Data and large artefacts (the dataset is not redistributed)
+data/
+models/*.joblib
+reports/scores/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Private notes
+BUILD_GUIDE.md
+
+# Scratch / generated locally
+Claude outputs/
+*.zip

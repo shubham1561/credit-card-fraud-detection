@@ -1,0 +1,20 @@
+{
+  "file": "creditcard.csv",
+  "sha256": "33a178be65174943a07d1736acf5898f6c8e1fa80950dbbe598c17eda968ec59",
+  "matches_mirror_used_for_reports": true,
+  "rows": 284807,
+  "frauds": 492,
+  "fraud_rate": 0.001727485630620034,
+  "missing_values": 0,
+  "expected": {
+    "rows": 284807,
+    "frauds": 492
+  },
+  "matches_expected": true,
+  "rows_after": 283726,
+  "duplicates_dropped": 1081,
+  "frauds_after": 473,
+  "fraud_duplicates_dropped": 19,
+  "fraud_rate_after": 0.001667101358352777,
+  "same_features_different_label": 0
+}

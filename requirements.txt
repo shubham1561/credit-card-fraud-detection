@@ -1,0 +1,19 @@
+# Python 3.10 or newer. Minimum versions; the exact ones that produced reports/ are in
+# requirements-lock.txt (install that file instead to reproduce the numbers exactly).
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+scikit-learn>=1.6        # FrozenEstimator, used for calibration
+xgboost>=2.0
+matplotlib>=3.8
+pyyaml>=6.0
+joblib>=1.3
+pytest>=8.0
+
+# Scoring API
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27              # needed by FastAPI's TestClient
+
+# Notebooks
+jupyter>=1.0

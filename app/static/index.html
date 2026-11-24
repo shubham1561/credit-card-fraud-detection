@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Card Fraud Detector</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #ffffff; --ink: #1b1b19; --ink-2: #5a5953; --muted: #8b8a84; --line: #e4e2dc;
+    --field: #fbfaf8; --accent: #2a78d6; --accent-ink: #ffffff;
+    --fraud: #c8352f; --fraud-bg: #fbeceb; --ok: #1d8a5a; --ok-bg: #e7f5ee; --warn: #a86a00; --warn-bg: #fdf3e1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --card: #1f1f1d; --ink: #f1f0ec; --ink-2: #b9b8b1; --muted: #85847e; --line: #34332f;
+      --field: #191918; --accent: #5b9be6; --accent-ink: #0d0d0c;
+      --fraud: #f07a73; --fraud-bg: #3a1f1d; --ok: #5cc996; --ok-bg: #173126; --warn: #e3ab4a; --warn-bg: #362a14;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 36px 16px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); margin: 0 0 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px; margin-bottom: 18px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 14px; font-weight: 600; }
+  .buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { font: inherit; font-size: 14px; font-weight: 600; border-radius: 9px; padding: 9px 14px; cursor: pointer;
+           border: 1px solid var(--line); background: var(--card); color: var(--ink); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-size: 16px; padding: 12px 20px; }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  label { display: block; font-size: 13px; color: var(--ink-2); margin-bottom: 4px; }
+  input[type=number] { width: 100%; font: inherit; font-variant-numeric: tabular-nums; padding: 8px 10px;
+        border: 1px solid var(--line); border-radius: 8px; background: var(--field); color: var(--ink); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 18px 0 6px; }
+  .sliders { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px 22px; margin-top: 8px; }
+  .slider .top { display: flex; justify-content: space-between; align-items: baseline; }
+  .slider .top input { width: 84px; padding: 4px 8px; }
+  .hint { font-size: 12px; color: var(--muted); }
+  details { margin-top: 18px; }
+  summary { cursor: pointer; color: var(--ink-2); font-size: 14px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-top: 12px; }
+  .source { font-size: 13px; color: var(--ink-2); margin-top: 14px; }
+  .verdict { border-radius: 12px; padding: 18px 20px; }
+  .verdict.fraud { background: var(--fraud-bg); }
+  .verdict.ok { background: var(--ok-bg); }
+  .verdict .big { font-size: 24px; font-weight: 700; }
+  .verdict.fraud .big { color: var(--fraud); }
+  .verdict.ok .big { color: var(--ok); }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 14px; }
+  .fact .k { color: var(--ink-2); font-size: 13px; }
+  .fact .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; font-size: 13px; font-weight: 600; border-radius: 999px; padding: 2px 10px; }
+  .badge.right { background: var(--ok-bg); color: var(--ok); }
+  .badge.wrong { background: var(--warn-bg); color: var(--warn); }
+  .bar { position: relative; height: 10px; border-radius: 5px; background: var(--line); margin: 14px 0 4px; }
+  .bar .fill { position: absolute; inset: 0 auto 0 0; border-radius: 5px; transition: width .15s; }
+  .bar .mark { position: absolute; top: -5px; width: 2px; height: 20px; background: var(--ink); }
+  .barlabel { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 14px; }
+  .tile { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .tile .v { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tile .k { color: var(--ink-2); font-size: 13px; }
+  .note { color: var(--muted); font-size: 13px; margin-top: 12px; }
+  .error { color: var(--fraud); }
+  .placeholder { color: var(--muted); }
+  footer { color: var(--muted); font-size: 13px; text-align: center; }
+  footer a { color: inherit; }
+  @media (max-width: 520px) { .row2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Card Fraud Detector</h1>
+  <p class="sub">Enter a card transaction and the XGBoost model decides whether to flag it for review. The result updates as you change the values.</p>
+
+  <section class="card">
+    <h2>1 · Enter a transaction</h2>
+    <div class="buttons">
+      <button data-load="fraud">Fill with a real fraud</button>
+      <button data-load="legitimate">Fill with a real legitimate one</button>
+      <button id="reset">Clear to a typical transaction</button>
+    </div>
+
+    <div class="row2">
+      <div><label for="Amount">Amount</label><input type="number" id="Amount" min="0" step="0.01" value="50"></div>
+      <div><label for="hour">Hour of day (0–23)</label><input type="number" id="hour" min="0" max="23" step="1" value="14"></div>
+    </div>
+
+    <p class="hint">The other inputs, V1–V28, are anonymised by the bank (PCA components), so they have no plain-English meaning.
+      The sliders are the six the model relies on most. Drag them toward the fraud values to see the decision flip.</p>
+    <div class="sliders" id="sliders"></div>
+
+    <details>
+      <summary>All 28 anonymised features</summary>
+      <div class="grid" id="allV"></div>
+    </details>
+
+    <div class="source" id="source">Typical transaction: every anonymised feature at 0, the average.</div>
+  </section>
+
+  <section class="card">
+    <h2>2 · Model decision</h2>
+    <div id="result"><p class="placeholder">Change any value above.</p></div>
+  </section>
+
+  <section class="card">
+    <h2>How good is the model overall?</h2>
+    <div class="buttons"><button id="block">Score all 56,744 held-out transactions</button></div>
+    <div id="blockOut"></div>
+  </section>
+
+  <footer id="foot">Model loading…</footer>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const V = Array.from({ length: 28 }, (_, i) => `V${i + 1}`);
+// The six features with the largest mean |SHAP| / class difference; ranges cover 99.8% of the data.
+const KEY = [
+  { f: "V14", min: -15, max: 8, legit: 0.05, fraud: -6.73 },
+  { f: "V4",  min: -5,  max: 13, legit: -0.02, fraud: 4.18 },
+  { f: "V12", min: -15, max: 6, legit: 0.14, fraud: -5.5 },
+  { f: "V10", min: -15, max: 12, legit: -0.09, fraud: -4.58 },
+  { f: "V11", min: -4,  max: 10, legit: -0.03, fraud: 3.59 },
+  { f: "V17", min: -15, max: 8, legit: -0.06, fraud: -5.3 },
+];
+const pct = (x) => (100 * x).toFixed(x < 0.001 ? 3 : 1) + "%";
+let loaded = null; // {kind, values}: set when a real transaction was loaded and is unchanged
+
+// ---- build the inputs
+$("#sliders").innerHTML = KEY.map((k) => `
+  <div class="slider">
+    <div class="top"><label for="s_${k.f}">${k.f}</label><input type="number" step="0.01" data-v="${k.f}" class="vin"></div>
+    <input type="range" id="s_${k.f}" min="${k.min}" max="${k.max}" step="0.05" data-slider="${k.f}">
+    <div class="hint">typical legitimate ${k.legit} · typical fraud ${k.fraud}</div>
+  </div>`).join("");
+$("#allV").innerHTML = V.map((f) => `<div><label>${f}</label><input type="number" step="0.01" data-v="${f}" class="vin"></div>`).join("");
+
+function setV(f, value) {
+  document.querySelectorAll(`[data-v="${f}"]`).forEach((el) => { el.value = Number(value).toFixed(2); });
+  const s = $(`[data-slider="${f}"]`);
+  if (s) s.value = value;
+}
+function readTx() {
+  const tx = { Time: 3600 * Number($("#hour").value || 0) + 1, Amount: Number($("#Amount").value || 0) };
+  V.forEach((f) => { tx[f] = Number(document.querySelector(`#allV [data-v="${f}"]`).value || 0); });
+  return tx;
+}
+function fill(tx) {
+  $("#Amount").value = tx.Amount.toFixed(2);
+  $("#hour").value = Math.floor(tx.Time / 3600) % 24;
+  V.forEach((f) => setV(f, tx[f]));
+}
+
+// ---- scoring
+async function api(path, options) {
+  const r = await fetch(path, options);
+  const body = await r.json();
+  if (!r.ok) throw new Error(typeof body.detail === "string" ? body.detail : "Check the values: amount and hour must be numbers, amount not negative.");
+  return body;
+}
+let timer;
+function rescore() { clearTimeout(timer); timer = setTimeout(score, 150); }
+async function score() {
+  const out = $("#result");
+  try {
+    const res = await api("/predict", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(readTx()) });
+    const flagged = res.flag_for_review, t = res.threshold ?? 1, s = res.fraud_score;
+    let truth = "";
+    if (loaded) {
+      const actual = loaded === "fraud", right = flagged === actual;
+      truth = `<div>This is a real transaction, actually <b>${loaded}</b> in the data
+        <span class="badge ${right ? "right" : "wrong"}">${right ? "model is right" : (actual ? "missed fraud" : "false alert")}</span></div>`;
+    }
+    out.innerHTML = `
+      <div class="verdict ${flagged ? "fraud" : "ok"}">
+        <div class="big">${flagged ? "Fraud: flag for review" : "Approve: looks legitimate"}</div>
+        ${truth}
+        <div class="bar"><div class="fill" style="width:${Math.max(1, s * 100)}%;background:${flagged ? "var(--fraud)" : "var(--ok)"}"></div>
+          <div class="mark" style="left:${t * 100}%"></div></div>
+        <div class="barlabel"><span>fraud score ${s.toFixed(4)}</span><span>flagged above ${t.toFixed(3)}</span></div>
+        <div class="facts">
+          <div class="fact"><div class="k">Chance it is fraud</div><div class="v">${pct(res.fraud_probability ?? s)}</div></div>
+          <div class="fact"><div class="k">Fraud score</div><div class="v">${s.toFixed(4)}</div></div>
+          <div class="fact"><div class="k">Alert threshold</div><div class="v">${t.toFixed(3)}</div></div>
+        </div>
+      </div>`;
+  } catch (e) { out.innerHTML = `<p class="error">${e.message}</p>`; }
+}
+
+// ---- events
+function edited() {
+  loaded = null;
+  $("#source").textContent = "Your own transaction, as entered above.";
+  rescore();
+}
+document.addEventListener("input", (ev) => {
+  const el = ev.target;
+  if (el.dataset.slider) setV(el.dataset.slider, el.value);
+  else if (el.dataset.v) setV(el.dataset.v, el.value === "" ? 0 : el.value);
+  if (el.matches("input")) edited();
+});
+document.querySelectorAll("[data-load]").forEach((b) => b.addEventListener("click", async () => {
+  b.disabled = true;
+  try {
+    const kind = b.dataset.load;
+    fill(await api(`/demo/transaction?kind=${kind}`));
+    loaded = kind;
+    $("#source").textContent = `Filled with a real ${kind} transaction the model never saw. Edit any value to make it your own.`;
+    score();
+  } catch (e) { $("#result").innerHTML = `<p class="error">${e.message}</p>`; }
+  finally { b.disabled = false; }
+}));
+$("#reset").addEventListener("click", () => {
+  $("#Amount").value = "50"; $("#hour").value = "14"; V.forEach((f) => setV(f, 0));
+  loaded = null; $("#source").textContent = "Typical transaction: every anonymised feature at 0, the average.";
+  score();
+});
+$("#block").addEventListener("click", async (ev) => {
+  ev.target.disabled = true;
+  try {
+    const r = await api("/demo/test-block");
+    $("#blockOut").innerHTML = `
+      <div class="tiles">
+        <div class="tile"><div class="v">${r.frauds_caught} / ${r.frauds}</div><div class="k">frauds caught (${pct(r.recall)})</div></div>
+        <div class="tile"><div class="v">${r.false_alerts}</div><div class="k">false alerts out of ${r.transactions.toLocaleString()}</div></div>
+        <div class="tile"><div class="v">${pct(r.precision)}</div><div class="k">of alerts are real fraud</div></div>
+      </div>
+      <p class="note">The latest 20% of the data by time, which the model never saw in training.</p>`;
+  } catch (e) { $("#blockOut").innerHTML = `<p class="error">${e.message}</p>`; }
+  finally { ev.target.disabled = false; }
+});
+
+V.forEach((f) => setV(f, 0));
+score();
+fetch("/health").then((r) => r.json()).then((h) => { $("#foot").innerHTML = `Model ${h.model_version} · <a href="/docs">API docs</a>`; })
+  .catch(() => { $("#foot").textContent = "Model not loaded: run python -m src.train --protocol time"; });
+</script>
+</body>
+</html>
